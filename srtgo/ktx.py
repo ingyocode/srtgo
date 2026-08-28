@@ -19,15 +19,29 @@ import re
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import reduce
+
+from .dynapath import (
+    DynaPathMasterEngine,
+    generate_nonce,
+    generate_sid,
+    needs_dynapath,
+)
 
 
 # Constants
+# 한국시간. 실행 환경 타임존과 무관하게 항상 UTC+9로 계산한다.
+# (원본은 `datetime.now() + timedelta(hours=9)`로 서버가 UTC라고 가정해
+#  한국 시간대 머신에서 9시간 어긋났다. 한국은 DST가 없어 고정 오프셋이면 충분하다.)
+KST = timezone(timedelta(hours=9))
+
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 PHONE_NUMBER_REGEX = re.compile(r"(\d{3})-(\d{3,4})-(\d{4})")
 
-USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S912N Build/UP1A.231005.007)"
+# DynaPath 토큰 본문의 `os=13` / `dm=SM-S928N`과 반드시 일치시켜야 한다.
+# (토큰이 주장하는 단말과 UA가 어긋나면 서버가 그 불일치만으로 걸러낼 수 있다.)
+USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; SM-S928N Build/UP1A.231005.007)"
 
 DEFAULT_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -52,6 +66,14 @@ API_ENDPOINTS = {
     "refund": f"{KORAIL_MOBILE}.refunds.RefundsRequest",
     "code": f"{KORAIL_MOBILE}.common.code.do",
 }
+
+
+def _to_int(value, fallback=0):
+    """응답 필드가 비었거나 숫자가 아니면 fallback (원본은 int(None)으로 크래시)"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 # Schedule classes
@@ -101,9 +123,10 @@ class Train(Schedule):
         self.reserve_possible_name = data.get("h_rsv_psb_nm")
         self.special_seat = data.get("h_spe_rsv_cd")
         self.general_seat = data.get("h_gen_rsv_cd")
-        self.wait_reserve_flag = data.get("h_wait_rsv_flg")
-        if self.wait_reserve_flag:
-            self.wait_reserve_flag = int(self.wait_reserve_flag)
+        wait_reserve_flag = data.get("h_wait_rsv_flg")
+        self.wait_reserve_flag = (
+            None if wait_reserve_flag in (None, "") else _to_int(wait_reserve_flag, -1)
+        )
 
     def __repr__(self):
         repr_str = super().__repr__()
@@ -121,7 +144,7 @@ class Train(Schedule):
         if self.reserve_possible_name:
             repr_str += f"  특실 {'가능' if self.has_special_seat() else '매진'}"
             repr_str += f", 일반실 {'가능' if self.has_general_seat() else '매진'}"
-            if self.wait_reserve_flag >= 0:
+            if self.wait_reserve_flag is not None and self.wait_reserve_flag >= 0:
                 repr_str += f", 예약대기 {'가능' if self.has_general_waiting_list() else '매진'}"
         repr_str += f" ({duration:>3d}분)"
         return repr_str
@@ -149,7 +172,7 @@ class Ticket(Train):
         raw_data = data["ticket_list"][0]["train_info"][0]
         super().__init__(raw_data)
         self.seat_no_end = raw_data.get("h_seat_no_end")
-        self.seat_no_count = int(raw_data.get("h_seat_cnt"))
+        self.seat_no_count = _to_int(raw_data.get("h_seat_cnt"))
         self.buyer_name = raw_data.get("h_buy_ps_nm")
         self.sale_date = raw_data.get("h_orgtk_sale_dt")
         self.pnr_no = raw_data.get("h_pnr_no")
@@ -157,14 +180,14 @@ class Ticket(Train):
         self.sale_info2 = raw_data.get("h_orgtk_ret_sale_dt")
         self.sale_info3 = raw_data.get("h_orgtk_sale_sqno")
         self.sale_info4 = raw_data.get("h_orgtk_ret_pwd")
-        self.price = int(raw_data.get("h_rcvd_amt"))
+        self.price = _to_int(raw_data.get("h_rcvd_amt"))
         self.car_no = raw_data.get("h_srcar_no")
         self.seat_no = raw_data.get("h_seat_no")
 
     def __repr__(self):
         repr_str = super(Train, self).__repr__()
         repr_str += f" => {self.car_no}호"
-        if int(self.seat_no_count) != 1:
+        if self.seat_no_count != 1:
             repr_str += f" {self.seat_no}~{self.seat_no_end}"
         else:
             repr_str += f" {self.seat_no}"
@@ -188,10 +211,10 @@ class Reservation(Train):
         self.dep_date = data.get("h_run_dt")
         self.arr_date = data.get("h_run_dt")
         self.rsv_id = data.get("h_pnr_no")
-        self.seat_no_count = int(data.get("h_tot_seat_cnt"))
+        self.seat_no_count = _to_int(data.get("h_tot_seat_cnt"))
         self.buy_limit_date = data.get("h_ntisu_lmt_dt")
         self.buy_limit_time = data.get("h_ntisu_lmt_tm")
-        self.price = int(data.get("h_rsv_amt"))
+        self.price = _to_int(data.get("h_rsv_amt"))
         self.journey_no = data.get("txtJrnySqno", "001")
         self.journey_cnt = data.get("txtJrnyCnt", "01")
         self.rsv_chg_no = data.get("hidRsvChgNo", "00000")
@@ -221,9 +244,9 @@ class Seat:
         self.seat = data.get("h_seat_no")
         self.seat_type = data.get("h_psrm_cl_nm")
         self.passenger_type = data.get("h_psg_tp_dv_nm")
-        self.price = int(data.get("h_rcvd_amt", 0))
-        self.original_price = int(data.get("h_seat_prc", 0))
-        self.discount = int(data.get("h_dcnt_amt", 0))
+        self.price = _to_int(data.get("h_rcvd_amt"))
+        self.original_price = _to_int(data.get("h_seat_prc"))
+        self.discount = _to_int(data.get("h_dcnt_amt"))
         self.is_waiting = self.seat == ""
 
     def __repr__(self):
@@ -515,9 +538,13 @@ class Korail:
             self._session = requests.session()
         self._session.headers.update(DEFAULT_HEADERS)
         self._device = "AD"
-        self._version = "240531001"
+        # 코레일 앱 버전. DynaPath 토큰과 세트로 최신값이어야 검색/예매가 통과한다.
+        self._version = "250601002"
         self._key = "korail1234567890"
         self._idx = None
+        self._device_id = "558a4f02041657ea"
+        # 앱 무결성 토큰 생성기. 인스턴스 생성 시각을 app_start_ts로 고정한다.
+        self._engine = DynaPathMasterEngine()
         self.korail_id = korail_id
         self.korail_pw = korail_pw
         self.verbose = verbose
@@ -529,9 +556,30 @@ class Korail:
         if auto_login:
             self.login(korail_id, korail_pw)
 
+    @property
+    def is_login(self):
+        """SRT 클래스와 이름을 맞춘 별칭"""
+        return self.logined
+
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[*] {msg}")
+
+    def _auth_headers_and_sid(self, url):
+        """앱 무결성 검증이 걸린 경로(로그인/열차조회/예매)에만 토큰 헤더와 Sid를 만든다.
+
+        헤더와 Sid는 **같은 timestamp**로 만들어야 한다 (서버가 둘을 대조한다).
+        """
+        if not needs_dynapath(url):
+            return {}, None
+
+        timestamp_ms = int(time.time() * 1000)
+        headers = {
+            "x-dynapath-m-token": self._engine.generate_token(
+                self._device_id, timestamp_ms, generate_nonce()
+            )
+        }
+        return headers, generate_sid(self._device, timestamp_ms)
 
     def __enc_password(self, password):
         url = API_ENDPOINTS["code"]
@@ -565,17 +613,21 @@ class Korail:
             else "2"
         )
 
+        # __enc_password가 self._idx를 설정하므로 idx보다 먼저 평가되어야 한다.
+        txt_pwd = self.__enc_password(self.korail_pw)
+        headers, sid = self._auth_headers_and_sid(API_ENDPOINTS["login"])
         data = {
             "Device": self._device,
             "Version": self._version,
             "Key": self._key,
             "txtMemberNo": self.korail_id,
-            "txtPwd": self.__enc_password(self.korail_pw),
+            "txtPwd": txt_pwd,
             "txtInputFlg": txt_input_flg,
             "idx": self._idx,
+            "Sid": sid,
         }
 
-        r = self._session.post(API_ENDPOINTS["login"], data=data)
+        r = self._session.post(API_ENDPOINTS["login"], data=data, headers=headers)
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -619,7 +671,7 @@ class Korail:
         include_no_seats=False,
         include_waiting_list=False,
     ):
-        kst_now = datetime.now() + timedelta(hours=9)
+        kst_now = datetime.now(KST)
         date = date or kst_now.strftime("%Y%m%d")
         time = time or kst_now.strftime("%H%M%S")
         passengers = passengers or [AdultPassenger()]
@@ -642,10 +694,11 @@ class Korail:
             ),
         }
 
+        headers, sid = self._auth_headers_and_sid(API_ENDPOINTS["search_schedule"])
         data = {
             "Device": self._device,
             "Version": self._version,
-            "Sid": "",
+            "Sid": sid or "",
             "txtMenuId": "11",
             "radJobId": "1",
             "selGoTrain": train_type,
@@ -669,7 +722,9 @@ class Korail:
             "mbCrdNo": self.membership_number,
         }
 
-        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data)
+        r = self._session.get(
+            API_ENDPOINTS["search_schedule"], params=data, headers=headers
+        )
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -692,7 +747,9 @@ class Korail:
             return trains
 
     def reserve(self, train, passengers=None, option=ReserveOption.GENERAL_FIRST):
-        reserving_seat = train.has_seat() or train.wait_reserve_flag < 0
+        reserving_seat = train.has_seat() or (
+            train.wait_reserve_flag is not None and train.wait_reserve_flag < 0
+        )
         if reserving_seat:
             is_special_seat = {
                 ReserveOption.GENERAL_ONLY: False,
@@ -712,10 +769,12 @@ class Korail:
         passengers = Passenger.reduce(passengers)
         cnt = sum(p.count for p in passengers)
 
+        headers, sid = self._auth_headers_and_sid(API_ENDPOINTS["reserve"])
         data = {
             "Device": self._device,
             "Version": self._version,
             "Key": self._key,
+            "Sid": sid,
             "txtMenuId": "11",
             "txtJobId": "1101" if reserving_seat else "1102",
             "txtGdNo": "",
@@ -757,7 +816,7 @@ class Korail:
         for i, psg in enumerate(passengers, 1):
             data.update(psg.get_dict(i))
 
-        r = self._session.get(API_ENDPOINTS["reserve"], params=data)
+        r = self._session.get(API_ENDPOINTS["reserve"], params=data, headers=headers)
         self._log(r.text)
         j = json.loads(r.text)
         if self._result_check(j):

@@ -113,8 +113,8 @@ STATIONS = {
     ],
 }
 DEFAULT_STATIONS = {
-    "SRT": ["수서", "대전", "동대구", "부산"],
-    "KTX": ["서울", "대전", "동대구", "부산"],
+    "SRT": ["수서", "용산", "동대구", "광주송정"],
+    "KTX": ["서울", "용산", "동대구", "광주송정"],
 }
 
 # 예약 간격 (평균 간격 (초) = SHAPE * SCALE): gamma distribution (1.25 +/- 0.25 s)
@@ -414,20 +414,33 @@ def set_login(rail_type="SRT", debug=False):
         return False
 
     try:
-        SRT(
-            login_info["id"], login_info["pass"], verbose=debug
-        ) if rail_type == "SRT" else Korail(
-            login_info["id"], login_info["pass"], verbose=debug
+        rail = (
+            SRT(login_info["id"], login_info["pass"], verbose=debug)
+            if rail_type == "SRT"
+            else Korail(login_info["id"], login_info["pass"], verbose=debug)
         )
+
+        # Korail은 로그인 실패 시 예외 대신 False를 반환하므로 직접 확인한다
+        if not rail.is_login:
+            print("로그인에 실패했습니다. 아이디와 패스워드를 확인해주세요.")
+            _clear_login_ok(rail_type)
+            return False
 
         keyring.set_password(rail_type, "id", login_info["id"])
         keyring.set_password(rail_type, "pass", login_info["pass"])
         keyring.set_password(rail_type, "ok", "1")
         return True
-    except SRTError as err:
+    except (SRTError, KorailError) as err:
         print(err)
-        keyring.delete_password(rail_type, "ok")
+        _clear_login_ok(rail_type)
         return False
+
+
+def _clear_login_ok(rail_type):
+    try:
+        keyring.delete_password(rail_type, "ok")
+    except keyring.errors.PasswordDeleteError:
+        pass
 
 
 def login(rail_type="SRT", debug=False):
@@ -711,6 +724,8 @@ def reserve(rail_type="SRT", debug=False):
 
             trains = rail.search_train(**params)
             for i in choice["trains"]:
+                if i >= len(trains):
+                    continue
                 if _is_seat_available(trains[i], options["type"], rail_type):
                     _reserve(trains[i])
                     return
