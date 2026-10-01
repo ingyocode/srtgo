@@ -16,6 +16,7 @@ except ImportError:
 import itertools
 import json
 import re
+import secrets
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -542,7 +543,8 @@ class Korail:
         self._version = "250601002"
         self._key = "korail1234567890"
         self._idx = None
-        self._device_id = "558a4f02041657ea"
+        # 기기 ID. 공용 고정값은 서버에서 차단되므로 인스턴스(예매 시작)마다 새로 만든다.
+        self._device_id = secrets.token_hex(8)
         # 앱 무결성 토큰 생성기. 인스턴스 생성 시각을 app_start_ts로 고정한다.
         self._engine = DynaPathMasterEngine()
         self.korail_id = korail_id
@@ -631,7 +633,10 @@ class Korail:
         self._log(r.text)
         j = json.loads(r.text)
 
-        if j["strResult"] == "SUCC" and j.get("strMbCrdNo"):
+        if j.get("code") == -2000:
+            raise KorailError(j.get("message"), str(j.get("code")))
+
+        if j.get("strResult") == "SUCC" and j.get("strMbCrdNo"):
             # self._key = j['Key']
             self.membership_number = j["strMbCrdNo"]
             self.name = j["strCustNm"]
