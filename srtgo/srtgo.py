@@ -19,7 +19,10 @@ import re
 
 from .ktx import (
     Korail,
+    KorailAuthError,
     KorailError,
+    KorailSoldOutError,
+    KorailTransportError,
     ReserveOption,
     TrainType,
     AdultPassenger,
@@ -763,14 +766,19 @@ def reserve(rail_type="SRT", debug=False):
             _sleep()
 
         except KorailError as ex:
-            msg = ex.msg
-            if "Need to Login" in msg:
+            msg = str(ex)
+            if isinstance(ex, KorailTransportError):
+                if not _handle_error(ex, "연결이 끊겼습니다"):
+                    return
+                rail = login(rail_type, debug=debug)
+                continue
+            if isinstance(ex, KorailAuthError):
+                # 세션 만료(P058) 또는 로그인 전 호출
                 rail = login(rail_type, debug=debug)
                 if not rail.is_login and not _handle_error(ex):
                     return
-            elif not any(
-                err in msg
-                for err in ("Sold out", "잔여석없음", "예약대기자한도수초과")
+            elif not isinstance(ex, KorailSoldOutError) and not any(
+                err in msg for err in ("잔여석없음", "예약대기자한도수초과")
             ):
                 if not _handle_error(ex):
                     return
@@ -826,7 +834,8 @@ def _is_seat_available(train, seat_type, rail_type):
         return train.special_seat_available()
     else:
         if not train.has_seat():
-            return train.has_waiting_list()
+            # 예약대기는 일반실만 신청할 수 있다
+            return seat_type != ReserveOption.SPECIAL_ONLY and train.has_waiting_list()
         if seat_type in [ReserveOption.GENERAL_FIRST, ReserveOption.SPECIAL_FIRST]:
             return train.has_seat()
         if seat_type == ReserveOption.GENERAL_ONLY:
